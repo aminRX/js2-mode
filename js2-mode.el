@@ -7454,22 +7454,23 @@ We do a depth-first traversal of NODE.  For any functions we find,
 we append the property name to QNAME, then call `js2-record-imenu-entry'."
   (let (right)
     (dolist (e (js2-object-node-elems node))  ; e is a `js2-object-prop-node'
-      (let ((left (js2-infix-node-left e))
-            ;; Element positions are relative to the parent position.
-            (pos (+ pos (js2-node-pos e))))
-        (cond
-         ;; foo: function() {...}
-         ((js2-function-node-p (setq right (js2-infix-node-right e)))
-          (when (js2-prop-node-name left)
-            ;; As a policy decision, we record the position of the property,
-            ;; not the position of the `function' keyword, since the property
-            ;; is effectively the name of the function.
-            (js2-record-imenu-entry right (append qname (list left)) pos)))
-         ;; foo: {object-literal} -- add foo to qname, offset position, and recurse
-         ((js2-object-node-p right)
-          (js2-record-object-literal right
-                                     (append qname (list (js2-infix-node-left e)))
-                                     (+ pos (js2-node-pos right)))))))))
+      (when (js2-infix-node-p e)
+        (let ((left (js2-infix-node-left e))
+              ;; Element positions are relative to the parent position.
+              (pos (+ pos (js2-node-pos e))))
+          (cond
+           ;; foo: function() {...}
+           ((js2-function-node-p (setq right (js2-infix-node-right e)))
+            (when (js2-prop-node-name left)
+              ;; As a policy decision, we record the position of the property,
+              ;; not the position of the `function' keyword, since the property
+              ;; is effectively the name of the function.
+              (js2-record-imenu-entry right (append qname (list left)) pos)))
+           ;; foo: {object-literal} -- add foo to qname, offset position, and recurse
+           ((js2-object-node-p right)
+            (js2-record-object-literal right
+                                       (append qname (list (js2-infix-node-left e)))
+                                       (+ pos (js2-node-pos right))))))))))
 
 (defun js2-node-top-level-decl-p (node)
   "Return t if NODE's name is defined in the top-level scope.
@@ -8096,18 +8097,29 @@ declared; probably to check them for errors."
         (list node)))
      ((js2-object-node-p node)
       (dolist (elem (js2-object-node-elems node))
-        ;; js2-infix-node-p catches both object prop node and initialized
-        ;; binding element (which is directly an infix node).
-        (when (js2-infix-node-p elem)
-          (push (js2-define-destruct-symbols
-                 (js2-infix-node-left elem)
-                 decl-type face ignore-not-in-block)
-                name-nodes)))
+        (let ((subexpr (cond
+                        ((and (js2-infix-node-p elem)
+                              (= js2-ASSIGN (js2-infix-node-type elem)))
+                         (js2-infix-node-left elem))
+                        ((and (js2-infix-node-p elem)
+                              (= js2-COLON (js2-infix-node-type elem)))
+                         (js2-infix-node-right elem))
+                        ((and (js2-unary-node-p elem)
+                              (= js2-TRIPLEDOT (js2-unary-node-type elem)))
+                         (js2-unary-node-operand elem)))))
+          (when subexpr
+            (push (js2-define-destruct-symbols
+                   subexpr decl-type face ignore-not-in-block)
+                  name-nodes))))
       (apply #'append (nreverse name-nodes)))
      ((js2-array-node-p node)
       (dolist (elem (js2-array-node-elems node))
         (when elem
-          (if (js2-infix-node-p elem) (setq elem (js2-infix-node-left elem)))
+          (setq elem (cond ((js2-infix-node-p elem) ;; default (=)
+                            (js2-infix-node-left elem))
+                           ((js2-unary-node-p elem) ;; rest (...)
+                            (js2-unary-node-operand elem))
+                           (t elem)))
           (push (js2-define-destruct-symbols
                  elem decl-type face ignore-not-in-block)
                 name-nodes)))
@@ -10478,19 +10490,13 @@ array-literals, array comprehensions and regular expressions."
 
 (defun js2-parse-array-literal (pos)
   (let ((after-lb-or-comma t)
-        after-comma tt elems pn
+        after-comma tt elems pn was-rest
         (continue t))
     (unless js2-is-in-destructuring
       (js2-push-scope (make-js2-scope))) ; for the legacy array comp
     (while continue
       (setq tt (js2-get-token))
       (cond
-       ;; comma
-       ((= tt js2-COMMA)
-        (setq after-comma (js2-current-token-end))
-        (if (not after-lb-or-comma)
-            (setq after-lb-or-comma t)
-          (push nil elems)))
        ;; end of array
        ((or (= tt js2-RB)
             (= tt js2-EOF))  ; prevent infinite loop
@@ -10504,27 +10510,18 @@ array-literals, array comprehensions and regular expressions."
                                       :len (- js2-ts-cursor pos)
                                       :elems (nreverse elems)))
         (apply #'js2-node-add-children pn (js2-array-node-elems pn)))
-       ;; destructuring binding
-       (js2-is-in-destructuring
-        (push (cond
-               ((and (= tt js2-NAME)
-                     (= js2-ASSIGN (js2-peek-token)))
-                ;; a=defaultValue
-                (js2-parse-initialized-binding (js2-parse-name js2-NAME)))
-               ((or (= tt js2-LC)
-                    (= tt js2-LB)
-                    (= tt js2-NAME))
-                ;; [a, b, c] | {a, b, c} | {a:x, b:y, c:z} | a
-                (js2-parse-destruct-primary-expr))
-               ;; invalid pattern
-               (t
-                (js2-report-error "msg.bad.var")
-                (make-js2-error-node)))
-              elems)
-        (setq after-lb-or-comma nil
-              after-comma nil))
+       ;; anything after rest element (...foo)
+       (was-rest
+        (js2-report-error "msg.param.after.rest"))
+       ;; comma
+       ((= tt js2-COMMA)
+        (setq after-comma (js2-current-token-end))
+        (if (not after-lb-or-comma)
+            (setq after-lb-or-comma t)
+          (push nil elems)))
        ;; array comp
        ((and (>= js2-language-version 170)
+             (not js2-is-in-destructuring)
              (= tt js2-FOR)          ; check for array comprehension
              (not after-lb-or-comma) ; "for" can't follow a comma
              elems                   ; must have at least 1 element
@@ -10538,9 +10535,12 @@ array-literals, array comprehensions and regular expressions."
           (js2-report-error "msg.no.bracket.arg"))
         (if (and (= tt js2-TRIPLEDOT)
                  (>= js2-language-version 200))
-            ;; spread operator
-            (push (js2-make-unary tt 'js2-parse-assign-expr)
-                  elems)
+            ;; rest/spread operator
+            (progn
+              (push (js2-make-unary tt 'js2-parse-assign-expr)
+                    elems)
+              (if js2-is-in-destructuring
+                  (setq was-rest t)))
           (js2-unget-token)
           (push (js2-parse-assign-expr) elems))
         (setq after-lb-or-comma nil
@@ -10738,16 +10738,19 @@ If ONLY-OF-P is non-nil, only the 'for (foo of bar)' form is allowed."
 `js2-method-node') as a string, or nil if it can't be
 represented as a string (e.g., the key is computed by an
 expression)."
-  (let ((key (js2-infix-node-left property-node)))
-    (when (js2-computed-prop-name-node-p key)
-      (setq key (js2-computed-prop-name-node-expr key)))
-    (cond
-     ((js2-name-node-p key)
-      (js2-name-node-name key))
-     ((js2-string-node-p key)
-      (js2-string-node-value key))
-     ((js2-number-node-p key)
-      (js2-number-node-value key)))))
+  (cond
+   ((js2-unary-node-p property-node) nil) ;; {...foo}
+   (t
+    (let ((key (js2-infix-node-left property-node)))
+      (when (js2-computed-prop-name-node-p key)
+        (setq key (js2-computed-prop-name-node-expr key)))
+      (cond
+       ((js2-name-node-p key)
+        (js2-name-node-name key))
+       ((js2-string-node-p key)
+        (js2-string-node-value key))
+       ((js2-number-node-p key)
+        (js2-number-node-value key)))))))
 
 (defun js2-parse-object-literal-elems (&optional class-p)
   (let ((pos (js2-current-token-beg))
@@ -10782,7 +10785,13 @@ expression)."
           (setq previous-token (js2-current-token)
                 tt (js2-get-prop-name-token))))
       (cond
-       ;; Found a property (of any sort)
+       ;; Rest/spread (...expr)
+       ((and (>= js2-language-version 200)
+             (not class-p) (not static) (not previous-token)
+             (= js2-TRIPLEDOT tt))
+        (setq after-comma nil
+              elem (js2-make-unary js2-TRIPLEDOT 'js2-parse-assign-expr)))
+       ;; Found a key/value property (of any sort)
        ((member tt (list js2-NAME js2-STRING js2-NUMBER js2-LB))
         (setq after-comma nil
               elem (js2-parse-named-prop tt previous-token))
